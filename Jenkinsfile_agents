@@ -56,7 +56,7 @@ pipeline {
                     unstash 'settings-code'
 
                     sh '''
-                        source /opt/jenkins-venv/bin/activate
+                        . /opt/jenkins-venv/bin/activate
                         python -m flake8 --exit-zero --format=pylint app/src > flake8.out
                     '''
 
@@ -64,7 +64,7 @@ pipeline {
                     stash name: 'flake8-res', includes: 'flake8.out'
 
                     sh '''
-                        source /opt/jenkins-venv/bin/activate
+                        . /opt/jenkins-venv/bin/activate
                         python -m bandit --exit-zero -r app/src -f custom -o bandit.out --msg-template "{abspath}:{line}: [{test_id}] {msg}"
                     '''
 
@@ -84,8 +84,7 @@ pipeline {
                 unstash 'settings-code'
 
                 sh '''
-                    source /opt/jenkins-venv/bin/activate
-
+                    
                     echo "=== SAM BUILD ==="
                     sam build --template-file app/template.yaml
                     sam validate --region us-east-1
@@ -109,7 +108,7 @@ pipeline {
                 sh '''
                     BASE_URL=$(aws cloudformation describe-stacks --stack-name todo-list-aws-staging --query "Stacks[0].Outputs[?OutputKey=='BaseUrlApi'].OutputValue" --region us-east-1 --output text)
 
-                    source /opt/jenkins-venv/bin/activate
+                    . /opt/jenkins-venv/bin/activate
                     export BASE_URL="$BASE_URL"
 
                     pytest app/test/integration/todoApiTest.py --junitxml=api-tests.xml -q --disable-warnings --maxfail=1
