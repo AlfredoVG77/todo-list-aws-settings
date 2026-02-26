@@ -1,0 +1,228 @@
+pipeline {
+    agent none
+
+    options {
+        skipDefaultCheckout()
+        skipStagesAfterUnstable()
+    }
+
+    stages {
+
+        /* ============================================================
+         * CLEAN WORKSPACE
+         * ============================================================ */
+        stage('Clean workspace') {
+            agent { label 'master' }
+            steps {
+                deleteDir()
+            }
+        }
+
+        /* ============================================================
+         * CHECKOUT APP CODE
+         * ============================================================ */
+        stage('Checkout app code') {
+            agent { label 'master' }
+            steps {
+                dir('app') {
+                    git branch: 'develop', url: 'https://github.com/AlfredoVG77/todo-list-aws-app.git'
+                }
+                stash name: 'app-code', includes: 'app/**'
+            }
+        }
+
+        /* ============================================================
+         * CHECKOUT SETTINGS
+         * ============================================================ */
+        stage('Checkout settings') {
+            agent { label 'master' }
+            steps {
+                dir('settings') {
+                    git branch: 'develop', url: 'https://github.com/AlfredoVG77/todo-list-aws-settings.git'
+                }
+                stash name: 'settings-code', includes: 'settings/**'
+            }
+        }
+
+        /* ============================================================
+         * STATIC TESTS
+         * ============================================================ */
+        stage('Static Test') {
+            agent { label 'test' }
+            steps {
+                catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+
+                    unstash 'app-code'
+                    unstash 'settings-code'
+
+                    sh '''
+                        source /opt/jenkins-venv/bin/activate
+                        python -m flake8 --exit-zero --format=pylint app/src > flake8.out
+                    '''
+
+                    recordIssues(tools: [flake8(pattern: 'flake8.out')])
+                    stash name: 'flake8-res', includes: 'flake8.out'
+
+                    sh '''
+                        source /opt/jenkins-venv/bin/activate
+                        python -m bandit --exit-zero -r app/src -f custom -o bandit.out --msg-template "{abspath}:{line}: [{test_id}] {msg}"
+                    '''
+
+                    recordIssues(tools: [pyLint(pattern: 'bandit.out')])
+                    stash name: 'bandit-res', includes: 'bandit.out'
+                }
+            }
+        }
+
+        /* ============================================================
+         * DEPLOY TO STAGING
+         * ============================================================ */
+        stage('Deploy to Staging') {
+            agent { label 'master' }
+            steps {
+                unstash 'app-code'
+                unstash 'settings-code'
+
+                sh '''
+                    source /opt/jenkins-venv/bin/activate
+
+                    echo "=== SAM BUILD ==="
+                    sam build --template-file app/template.yaml
+                    sam validate --region us-east-1
+
+                    echo "=== SAM DEPLOY TO STAGING ==="
+                    sam deploy \
+                        --stack-name todo-list-aws-staging --region us-east-1 --capabilities CAPABILITY_IAM --resolve-s3 --s3-prefix todo-list-aws --parameter-overrides Stage=staging --no-fail-on-empty-changeset --no-confirm-changeset || true
+                '''
+            }
+        }
+
+        /* ============================================================
+         * API TESTS
+         * ============================================================ */
+        stage('API Tests') {
+            agent { label 'test' }
+            steps {
+                unstash 'app-code'
+                unstash 'settings-code'
+
+                sh '''
+                    BASE_URL=$(aws cloudformation describe-stacks --stack-name todo-list-aws-staging --query "Stacks[0].Outputs[?OutputKey=='BaseUrlApi'].OutputValue" --region us-east-1 --output text)
+
+                    source /opt/jenkins-venv/bin/activate
+                    export BASE_URL="$BASE_URL"
+
+                    pytest app/test/integration/todoApiTest.py --junitxml=api-tests.xml -q --disable-warnings --maxfail=1
+                '''
+
+                junit 'api-tests.xml'
+            }
+        }
+
+        /* ============================================================
+         * PROMOTE APP TO MASTER 
+         * ============================================================ */
+        stage('Promote app to master') {
+            agent { label 'master' }
+            steps {
+                unstash 'app-code'
+                dir('app') {
+                    withCredentials([string(credentialsId: 'github-token', variable: 'GITHUB_TOKEN')]) {
+                        sh '''
+                            echo "=== PROMOCIONANDO APP ==="
+
+                            git config user.email "jenkins@ci"
+                            git config user.name "Jenkins CI"
+
+                            git checkout develop
+                            git pull origin develop
+
+                            LAST_VERSION=$(grep -oP '^## \\[\\K[0-9]+\\.[0-9]+\\.[0-9]+' CHANGELOG.md | head -n 1)
+                            NEW_VERSION=$(echo $LAST_VERSION | awk -F. '{$NF+=1; OFS="."; print}')
+                            TODAY=$(date +%Y-%m-%d)
+
+                            awk -v ver="$NEW_VERSION" -v date="$TODAY" '
+                                NR==1 {print; print ""; print "## [" ver "] - " date; print "### Changed"; print "- Actualización automática en develop."; next}
+                                {print}
+                            ' CHANGELOG.md > CHANGELOG.tmp && mv CHANGELOG.tmp CHANGELOG.md
+
+                            git add CHANGELOG.md
+                            git commit -m "Update CHANGELOG in develop - version $NEW_VERSION" || true
+
+                            git remote set-url origin https://AlfredoVG77:${GITHUB_TOKEN}@github.com/AlfredoVG77/todo-list-aws-app.git
+                            git push origin develop
+
+                            echo "=== PROMOCIONANDO A MASTER ==="
+
+                            git fetch origin master
+                            git checkout master
+
+                            git merge origin/develop --no-edit || true
+
+                            git commit -m "Promoción automática app - versión $NEW_VERSION" || true
+                            git push origin master
+                        '''
+                    }
+                }
+            }
+        }
+
+        /* ============================================================
+         * PROMOTE SETTINGS TO MASTER (PROTEGE Jenkinsfiles)
+         * ============================================================ */
+        stage('Promote settings to master') {
+            agent { label 'master' }
+            steps {
+                unstash 'settings-code'
+                dir('settings') {
+                    withCredentials([string(credentialsId: 'github-token', variable: 'GITHUB_TOKEN')]) {
+                        sh '''
+                            echo "=== PROMOCIONANDO SETTINGS ==="
+
+                            git config user.email "jenkins@ci"
+                            git config user.name "Jenkins CI"
+
+                            git checkout develop
+                            git pull origin develop
+
+                            LAST_VERSION=$(grep -oP '^## \\[\\K[0-9]+\\.[0-9]+\\.[0-9]+' CHANGELOG.md | head -n 1)
+                            NEW_VERSION=$(echo $LAST_VERSION | awk -F. '{$NF+=1; OFS="."; print}')
+                            TODAY=$(date +%Y-%m-%d)
+
+                            awk -v ver="$NEW_VERSION" -v date="$TODAY" '
+                                NR==1 {print; print ""; print "## [" ver "] - " date; print "### Changed"; print "- Actualización automática en develop."; next}
+                                {print}
+                            ' CHANGELOG.md > CHANGELOG.tmp && mv CHANGELOG.tmp CHANGELOG.md
+
+                            git add CHANGELOG.md
+                            git commit -m "Update CHANGELOG in develop - version $NEW_VERSION" || true
+
+                            git remote set-url origin https://AlfredoVG77:${GITHUB_TOKEN}@github.com/AlfredoVG77/todo-list-aws-settings.git
+                            git push origin develop
+
+                            echo "=== PROMOCIONANDO A MASTER ==="
+
+                            git fetch origin master
+                            git checkout master
+
+                            git rm --cached Jenkinsfile_agents || true
+                            git commit -m "Preparar merge: excluir Jenkinsfiles" || true
+
+                            git checkout origin/master -- Jenkinsfile_agents
+                            git add Jenkinsfile_agents
+                            git commit -m "Restaurar Jenkinsfiles de master antes del merge" || true
+
+                            git merge origin/develop --no-edit || true
+
+                            git checkout origin/master -- Jenkinsfile_agents
+                            git add Jenkinsfile_agents
+                            git commit -m "Mantener Jenkinsfiles de master" || true
+
+                            git push origin master
+                        '''
+                    }
+                }
+            }
+        }
+    }
+}
